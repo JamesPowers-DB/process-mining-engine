@@ -1,0 +1,12 @@
+command: ["gunicorn", "--bind=0.0.0.0:8000", "--timeout=300", "--workers=2", "app:server"]
+
+env:
+  - name: CATALOG
+    value: "pos_demo_dev"
+  - name: SCHEMA
+    value: "pos_mining"
+  # DATABRICKS_HOST and DATABRICKS_TOKEN are injected automatically by the
+  # Databricks Apps runtime — do not define them here.
+  # WAREHOUSE_ID must be set at deploy time via the bundle variable ${var.warehouse_id}
+  - name: WAREHOUSE_ID
+    valueFrom: warehouse_endpoint

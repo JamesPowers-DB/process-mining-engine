@@ -1,0 +1,77 @@
+resources:
+  pipelines:
+    pos_process_mining:
+      name: pos-process-mining-demo
+      description: "Retail POS Process Mining — Bronze → Silver → Gold Medallion Pipeline"
+
+      # ── Unity Catalog target ──────────────────────────────────────────────────
+      catalog: ${var.catalog}
+      target: ${var.schema}
+
+      # ── Serverless compute (Lakeflow SDP) ─────────────────────────────────────
+      serverless: true
+      channel: PREVIEW
+
+      # ── Configuration passed to pipeline notebooks ───────────────────────────
+      configuration:
+        pos.source_volume_path: "/Volumes/${var.catalog}/${var.schema}/${var.volume_name}"
+        pos.catalog: ${var.catalog}
+        pos.schema: ${var.schema}
+
+      # ── Source files (order matters — dependencies resolved by DLT DAG) ───────
+      libraries:
+        - file:
+            path: ../src/pipeline/bronze.py
+        - file:
+            path: ../src/pipeline/silver_transactions.py
+        - file:
+            path: ../src/pipeline/silver_items.py
+        - file:
+            path: ../src/pipeline/silver_incidents.py
+        - file:
+            path: ../src/pipeline/silver_tender.py
+        - file:
+            path: ../src/pipeline/gold_event_log.py
+        - file:
+            path: ../src/pipeline/gold_dfg.py
+
+      # ── Notifications ────────────────────────────────────────────────────────
+      continuous: false
+
+      development: true
+
+  jobs:
+    pos_data_generator:
+      name: pos-data-generator
+      description: "Run the synthetic POS data generator notebook once to seed the volume"
+      tasks:
+        - task_key: generate_pos_data
+          notebook_task:
+            notebook_path: ../src/generator/generate_pos_data.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              volume_name: ${var.volume_name}
+              num_transactions: "20000"
+          job_cluster_key: generator_cluster
+
+      job_clusters:
+        - job_cluster_key: generator_cluster
+          new_cluster:
+            spark_version: 15.4.x-scala2.12
+            node_type_id: i3.xlarge
+            num_workers: 2
+            spark_conf:
+              spark.databricks.delta.preview.enabled: "true"
+
+  apps:
+    pos_process_mining_app:
+      name: pos-process-mining-app
+      description: "Interactive DFG visualization for POS transaction process mining"
+      source_code_path: ../app
+      resources:
+        - name: 'warehouse_endpoint'
+          sql_warehouse:
+            id: ${var.warehouse_id}
+            permission: 'CAN_USE'
+      

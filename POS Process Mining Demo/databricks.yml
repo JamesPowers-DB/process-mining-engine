@@ -1,0 +1,48 @@
+bundle:
+  name: pos-process-mining-demo
+
+# ── Variables ──────────────────────────────────────────────────────────────────
+variables:
+  catalog:
+    description: Unity Catalog catalog name
+    default: pos_demo
+  schema:
+    description: Unity Catalog schema name
+    default: pos_mining
+  volume_name:
+    description: UC Volume name for raw JSON files
+    default: raw_pos_data
+  warehouse_id:
+    description: SQL Warehouse ID for the Databricks App
+    default: ""
+  
+# ── Include resource definitions ───────────────────────────────────────────────
+include:
+  - resources/*.yml
+
+# ── Targets ───────────────────────────────────────────────────────────────────
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      root_path: ~/.bundle/${bundle.name}/dev
+    variables:
+      catalog: pos_demo_dev
+      schema: pos_mining
+
+  staging:
+    mode: development
+    workspace:
+      root_path: ~/.bundle/${bundle.name}/staging
+    variables:
+      catalog: pos_demo
+      schema: pos_mining_staging
+
+  prod:
+    mode: production
+    workspace:
+      root_path: /Shared/bundles/${bundle.name}
+    variables:
+      catalog: pos_demo
+      schema: pos_mining
