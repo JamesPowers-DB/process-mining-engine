@@ -17,6 +17,20 @@ The initial HTTP GET returns immediately (no blocking calls at import or layout
 time). A dcc.Interval fires 500 ms after the browser renders the page, which
 triggers the SQL load asynchronously. This prevents upstream proxy timeouts
 caused by slow SQL warehouse warm-up.
+
+Selection highlighting
+----------------------
+Node selection is tracked via selectedNodeData (supports click-background-to-
+deselect). Highlighting is applied by returning a dynamic stylesheet from a
+callback rather than by modifying element classes — this avoids triggering a
+layout re-run every time the user clicks a node.
+
+Edge curve style
+----------------
+Uses curve-style: bezier with control-point-step-size to automatically
+separate parallel and bidirectional edges. Cytoscape.js (canvas renderer)
+does not support edge crossing bumps/bridges; bezier auto-separation is the
+recommended alternative for crossing clarity.
 """
 
 import os
@@ -24,7 +38,7 @@ import math
 import logging
 import pandas as pd
 import dash
-from dash import html, dcc, Input, Output, callback
+from dash import html, dcc, Input, Output, State, callback
 import dash_cytoscape as cyto
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import StatementState, Disposition, Format
@@ -36,15 +50,10 @@ logger = logging.getLogger(__name__)
 cyto.load_extra_layouts()
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-# DATABRICKS_HOST and DATABRICKS_TOKEN are injected automatically by the
-# Databricks Apps runtime.  WorkspaceClient() picks them up via its standard
-# credential chain — no explicit token handling required.
 WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID", "")
 CATALOG = os.environ.get("CATALOG", "pos_demo")
 SCHEMA = os.environ.get("SCHEMA", "pos_mining")
 
-# Lazy-initialised — not created at import time so the page HTML is served
-# immediately even before the SDK resolves credentials.
 _ws_client: WorkspaceClient | None = None
 
 
@@ -57,32 +66,39 @@ def _get_client() -> WorkspaceClient:
 
 # ── Activity category → color mapping ────────────────────────────────────────
 CATEGORY_COLORS = {
-    "TRANSACTION_LIFECYCLE": "#1565C0",  # deep blue
-    "ITEM_SCAN":             "#2E7D32",  # deep green
-    "INCIDENT":              "#C62828",  # deep red
-    "PAYMENT":               "#6A1B9A",  # deep purple
+    "TRANSACTION_LIFECYCLE": "#1565C0",
+    "ITEM_SCAN":             "#2E7D32",
+    "INCIDENT":              "#C62828",
+    "PAYMENT":               "#6A1B9A",
 }
-DEFAULT_COLOR = "#455A64"  # blue-grey for unknown
+DEFAULT_COLOR = "#455A64"
+
+
+# ── Frequency slider — power-of-2 geometric sequence (20 steps) ──────────────
+# [0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k, 256k]
+FREQ_STEPS: list[int] = [0] + [2**i for i in range(19)]
+
+
+def _fmt_step(v: int) -> str:
+    """Abbreviated label for a frequency step value."""
+    if v >= 1_000_000:
+        return f"{v // 1_000_000}M"
+    if v >= 1_000:
+        return f"{v // 1_000}k"
+    return str(v)
 
 
 # ── Data access via SDK Statement Execution API ───────────────────────────────
 
 def _query_df(sql: str) -> pd.DataFrame:
-    """
-    Execute SQL against a Databricks SQL Warehouse using the SDK's Statement
-    Execution API.  The SDK uses the standard credential chain (DATABRICKS_HOST
-    + DATABRICKS_TOKEN env vars in Apps, PAT locally) — no OAuth browser flow
-    is ever initiated.
-    """
     ws = _get_client()
     response = ws.statement_execution.execute_statement(
         warehouse_id=WAREHOUSE_ID,
         statement=sql,
-        wait_timeout="50s",          # wait up to 50 s inline before polling
+        wait_timeout="50s",
         disposition=Disposition.INLINE,
         format=Format.JSON_ARRAY,
     )
-
     if response.status.state != StatementState.SUCCEEDED:
         err = response.status.error
         raise RuntimeError(
@@ -90,21 +106,12 @@ def _query_df(sql: str) -> pd.DataFrame:
             f"{err.error_code if err else 'unknown'} — "
             f"{err.message if err else ''}"
         )
-
     cols = [c.name for c in (response.manifest.schema.columns or [])]
     rows = response.result.data_array or []
-    # data_array rows are lists of string-encoded values; cast via DataFrame
     return pd.DataFrame(rows, columns=cols)
 
 
 def load_dfg_data():
-    """
-    Fetch nodes and edges from Unity Catalog Gold tables.
-
-    The Statement Execution API returns all values as strings in JSON_ARRAY
-    format.  Cast numeric columns explicitly so downstream math (max, sqrt,
-    etc.) works correctly.
-    """
     logger.info("Loading DFG data from Unity Catalog...")
 
     nodes_df = _query_df(f"""
@@ -142,16 +149,13 @@ def load_dfg_data():
                 "p50_transition_duration_ms", "p95_transition_duration_ms"):
         edges_df[col] = pd.to_numeric(edges_df[col], errors="coerce").fillna(0)
 
-    logger.info(
-        "Loaded %d nodes, %d edges", len(nodes_df), len(edges_df)
-    )
+    logger.info("Loaded %d nodes, %d edges", len(nodes_df), len(edges_df))
     return nodes_df, edges_df
 
 
 # ── Cytoscape element builder ─────────────────────────────────────────────────
 
 def _edge_width(frequency: int, max_freq: int) -> float:
-    """Scale edge width between 1px and 12px based on frequency."""
     if max_freq == 0:
         return 2
     ratio = math.sqrt(frequency / max_freq)
@@ -161,6 +165,7 @@ def _edge_width(frequency: int, max_freq: int) -> float:
 def _format_ms(ms) -> str:
     if ms is None or (isinstance(ms, float) and math.isnan(ms)):
         return "—"
+    ms = float(ms)
     s = ms / 1000
     if s < 60:
         return f"{s:.1f}s"
@@ -170,36 +175,42 @@ def _format_ms(ms) -> str:
 
 def build_cytoscape_elements(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
                               min_freq: int = 0):
-    """Build the list of Cytoscape node + edge element dicts."""
     elements = []
-
     if nodes_df.empty:
         return elements
 
     max_freq = int(edges_df["edge_frequency"].max()) if not edges_df.empty else 1
-
     filtered_edges = edges_df[edges_df["edge_frequency"] >= min_freq]
     active_activities = set(filtered_edges["source_activity"]).union(
         filtered_edges["target_activity"]
     )
-
-    # Always include start/end nodes even if they have no surviving edges
     for _, row in nodes_df.iterrows():
         if row["start_count"] > 0 or row["end_count"] > 0:
             active_activities.add(row["activity_name"])
+
+    # Detect self-loop activities (edges where source == target)
+    self_loop_set: set[str] = set()
+    if not filtered_edges.empty:
+        loop_mask = (
+            filtered_edges["source_activity"] == filtered_edges["target_activity"]
+        )
+        self_loop_set = set(filtered_edges.loc[loop_mask, "source_activity"].unique())
 
     for _, row in nodes_df.iterrows():
         name = row["activity_name"]
         if name not in active_activities:
             continue
-
         category = row.get("activity_category", "")
         color = CATEGORY_COLORS.get(category, DEFAULT_COLOR)
-
+        has_loop = name in self_loop_set
+        # Append a circular arrow indicator to the label for self-loop activities
+        label = name.replace("_", " ").title()
+        if has_loop:
+            label += "\n↺"
         elements.append({
             "data": {
                 "id": name,
-                "label": name.replace("_", " ").title(),
+                "label": label,
                 "activity_name": name,
                 "occurrence_count": int(row["occurrence_count"]),
                 "case_count": int(row["case_count"]),
@@ -210,12 +221,14 @@ def build_cytoscape_elements(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
                 "color": color,
                 "is_start": row["start_count"] > 0,
                 "is_end": row["end_count"] > 0,
+                "has_self_loop": has_loop,
             }
         })
 
     for _, row in filtered_edges.iterrows():
         freq = int(row["edge_frequency"])
         width = _edge_width(freq, max_freq)
+        is_loop = row["source_activity"] == row["target_activity"]
         elements.append({
             "data": {
                 "id": f"{row['source_activity']}→{row['target_activity']}",
@@ -228,19 +241,18 @@ def build_cytoscape_elements(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
                 "p50_ms": float(row.get("p50_transition_duration_ms") or 0),
                 "p95_ms": float(row.get("p95_transition_duration_ms") or 0),
                 "width": width,
+                "is_self_loop": is_loop,
             }
         })
 
     return elements
 
 
-# ── Stylesheet ────────────────────────────────────────────────────────────────
-# Nodes: fixed-size round-rectangles, light-gray fill, category-colored border.
-# Edges: taxi (orthogonal elbow) routing.
-NODE_W = 160   # px — wide enough for longest wrapped activity label
-NODE_H = 60    # px — tall enough for 3 lines at 11px
+# ── Base stylesheet ───────────────────────────────────────────────────────────
+NODE_W = 180
+NODE_H = 60
 
-CYTOSCAPE_STYLE = [
+BASE_STYLESHEET = [
     {
         "selector": "node",
         "style": {
@@ -248,10 +260,10 @@ CYTOSCAPE_STYLE = [
             "shape": "round-rectangle",
             "width": NODE_W,
             "height": NODE_H,
-            "background-color": "#F5F5F5",   # light gray fill
-            "border-color": "data(color)",    # category color on the outline
+            "background-color": "#F5F5F5",
+            "border-color": "data(color)",
             "border-width": 3,
-            "color": "#2D3748",               # dark text for contrast on gray
+            "color": "#2D3748",
             "font-size": "11px",
             "font-family": "Segoe UI, system-ui, sans-serif",
             "text-wrap": "wrap",
@@ -261,34 +273,23 @@ CYTOSCAPE_STYLE = [
             "font-weight": "600",
         },
     },
-    # Start nodes: thicker green border
     {
         "selector": "node[?is_start]",
-        "style": {
-            "border-width": 4,
-            "border-color": "#00897B",
-        },
+        "style": {"border-width": 4, "border-color": "#00897B"},
     },
-    # End nodes: thicker orange border
     {
         "selector": "node[?is_end]",
-        "style": {
-            "border-width": 4,
-            "border-color": "#EF6C00",
-        },
+        "style": {"border-width": 4, "border-color": "#EF6C00"},
     },
-    # Selected: yellow highlight ring
     {
-        "selector": "node:selected",
+        # Self-loop nodes: double border to signal the circular connection.
+        # The ↺ character in the label provides a second indicator.
+        "selector": "node[?has_self_loop]",
         "style": {
-            "border-width": 5,
-            "border-color": "#FFD600",
-            "overlay-color": "#FFD600",
-            "overlay-padding": 6,
-            "overlay-opacity": 0.15,
+            "border-style": "double",
+            "border-width": 7,
         },
     },
-    # Edges: orthogonal / elbow routing
     {
         "selector": "edge",
         "style": {
@@ -297,10 +298,12 @@ CYTOSCAPE_STYLE = [
             "line-color": "#B0BEC5",
             "target-arrow-color": "#B0BEC5",
             "target-arrow-shape": "vee",
-            "curve-style": "taxi",
-            "taxi-direction": "horizontal",   # horizontal segment first (LR layout)
-            "taxi-turn": "50%",               # elbow at midpoint between nodes
-            "taxi-turn-min-distance": 20,
+            # bezier auto-offsets parallel and bidirectional edge pairs so they
+            # don't overlap. control-point-step-size controls the spread.
+            # Note: Cytoscape.js canvas renderer does not support crossing
+            # bumps/bridges — bezier separation achieves the same visual clarity.
+            "curve-style": "bezier",
+            "control-point-step-size": 40,
             "font-size": "9px",
             "color": "#546E7A",
             "text-background-color": "#FFFFFF",
@@ -310,28 +313,135 @@ CYTOSCAPE_STYLE = [
         },
     },
     {
-        "selector": "edge:selected",
+        # Self-loop edges: orange dashed style for visual distinction.
+        # Cytoscape.js renders source==target edges as a loop automatically.
+        "selector": "edge[?is_self_loop]",
         "style": {
-            "line-color": "#FFD600",
-            "target-arrow-color": "#FFD600",
-            "font-weight": "bold",
+            "line-color": "#EF6C00",
+            "target-arrow-color": "#EF6C00",
+            "line-style": "dashed",
+            "loop-direction": "-45deg",
+            "loop-sweep": "45deg",
         },
     },
 ]
 
+
+def _compute_stylesheet(selected_node_id: str | None,
+                        edges_json: str | None) -> list:
+    """
+    Extend BASE_STYLESHEET with highlight rules for the selected node.
+
+    Uses Cytoscape data attribute selectors ([source = '...']) and #id selectors
+    rather than element classes — this lets us update only the stylesheet prop
+    (no element rebuild) so the layout stays stable while the user clicks around.
+    """
+    stylesheet = list(BASE_STYLESHEET)
+    if not selected_node_id or not edges_json or edges_json == "[]":
+        return stylesheet
+
+    try:
+        edges_df = pd.read_json(edges_json, orient="records")
+    except Exception:
+        return stylesheet
+
+    outgoing = edges_df[edges_df["source_activity"] == selected_node_id]
+    neighbor_ids = list(outgoing["target_activity"].unique())
+    non_dimmed = list(dict.fromkeys([selected_node_id] + neighbor_ids))
+
+    # Dim all nodes that are neither the selected node nor a neighbor.
+    not_chain = "".join(f":not(#{nid})" for nid in non_dimmed)
+    stylesheet.append({
+        "selector": f"node{not_chain}",
+        "style": {"opacity": 0.18},
+    })
+
+    # Dim all edges except outgoing ones from the selected node
+    stylesheet.append({
+        "selector": f"edge[source != '{selected_node_id}']",
+        "style": {"opacity": 0.07},
+    })
+
+    # Highlight outgoing edges (including self-loop if present)
+    stylesheet.append({
+        "selector": f"edge[source = '{selected_node_id}']",
+        "style": {
+            "line-color": "#FFB300",
+            "target-arrow-color": "#FFB300",
+            "line-style": "solid",
+            "opacity": 1.0,
+        },
+    })
+
+    # Highlight neighbor nodes (targets of outgoing edges)
+    for nid in neighbor_ids:
+        if nid == selected_node_id:
+            continue  # skip self-loop — selected node style wins below
+        stylesheet.append({
+            "selector": f"#{nid}",
+            "style": {
+                "border-color": "#FF6F00",
+                "border-width": 5,
+                "background-color": "#FFF3E0",
+                "opacity": 1.0,
+            },
+        })
+
+    # Highlight selected node last so it wins over neighbor styles
+    stylesheet.append({
+        "selector": f"#{selected_node_id}",
+        "style": {
+            "border-color": "#FFD600",
+            "border-width": 6,
+            "background-color": "#FFFDE7",
+            "opacity": 1.0,
+        },
+    })
+
+    return stylesheet
+
+
 # ── Status banner styles ──────────────────────────────────────────────────────
 _BANNER_BASE = {
-    "padding": "6px 16px",
+    "padding": "5px 14px",
     "borderRadius": "4px",
     "fontSize": "12px",
-    "marginBottom": "6px",
-    "flexShrink": 0,
+    "margin": "6px 0",
 }
-BANNER_LOADING = {**_BANNER_BASE, "backgroundColor": "#E3F2FD", "color": "#1565C0"}
-BANNER_OK      = {**_BANNER_BASE, "backgroundColor": "#E8F5E9", "color": "#2E7D32"}
-BANNER_ERROR   = {**_BANNER_BASE, "backgroundColor": "#FFEBEE", "color": "#C62828"}
-BANNER_HIDDEN  = {**_BANNER_BASE, "display": "none"}
+BANNER_OK     = {**_BANNER_BASE, "backgroundColor": "#E8F5E9", "color": "#2E7D32"}
+BANNER_ERROR  = {**_BANNER_BASE, "backgroundColor": "#FFEBEE", "color": "#C62828"}
+BANNER_HIDDEN = {**_BANNER_BASE, "display": "none"}
 
+
+# ── Helper UI components ───────────────────────────────────────────────────────
+
+def _stat_chip(label: str, value: str):
+    """Compact vertical label + value chip for the details bar."""
+    return html.Div(
+        style={
+            "display": "flex",
+            "flexDirection": "column",
+            "paddingLeft": "12px",
+            "borderLeft": "2px solid #E0E0E0",
+        },
+        children=[
+            html.Span(label, style={"fontSize": "10px", "color": "#90A4AE",
+                                    "lineHeight": "1.3", "whiteSpace": "nowrap"}),
+            html.Span(value, style={"fontSize": "13px", "fontWeight": "bold",
+                                    "color": "#2D3748", "lineHeight": "1.4",
+                                    "whiteSpace": "nowrap"}),
+        ],
+    )
+
+
+# ── Initial slider marks (shown before data loads) ────────────────────────────
+_INIT_MARKS = {
+    i: {
+        "label": _fmt_step(FREQ_STEPS[i]) if i % 2 == 0 else " ",
+        "style": {"fontSize": "10px"},
+    }
+    for i in range(20)
+}
 
 # ── App layout ────────────────────────────────────────────────────────────────
 app = dash.Dash(
@@ -340,23 +450,19 @@ app = dash.Dash(
     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
     external_stylesheets=["https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css"],
 )
-server = app.server  # expose WSGI server for gunicorn
+server = app.server
 
-# ── App layout ────────────────────────────────────────────────────────────────
-# Outer div: full-viewport background.
-# Inner div: max 1000px, centered — all visible chrome lives here.
 app.layout = html.Div(
     style={"backgroundColor": "#ECEFF1", "minHeight": "100vh",
            "fontFamily": "Segoe UI, system-ui, sans-serif"},
     children=[html.Div(
-        style={"maxWidth": "1000px", "margin": "0 auto",
-               "height": "100vh", "display": "flex", "flexDirection": "column"},
+        style={"maxWidth": "1200px", "margin": "0 auto", "paddingBottom": "1.5rem"},
         children=[
 
-            # ── Navbar (Bulma) ─────────────────────────────────────────────
+            # ── Navbar ─────────────────────────────────────────────────────
             html.Nav(
                 className="navbar is-dark",
-                style={"flexShrink": 0, "paddingLeft": "1rem", "paddingRight": "1rem"},
+                style={"paddingLeft": "1rem", "paddingRight": "1rem"},
                 children=[
                     html.Div(className="navbar-brand", children=[
                         html.Div(className="navbar-item", children=[
@@ -379,10 +485,10 @@ app.layout = html.Div(
                 ],
             ),
 
-            # ── Status notification (Bulma) ────────────────────────────────
+            # ── Status banner ───────────────────────────────────────────────
             html.Div(id="status-banner", style=BANNER_HIDDEN),
 
-            # ── Controls bar ───────────────────────────────────────────────
+            # ── Controls bar ────────────────────────────────────────────────
             html.Div(
                 className="box",
                 style={
@@ -392,50 +498,47 @@ app.layout = html.Div(
                     "alignItems": "center",
                     "gap": "24px",
                     "flexWrap": "wrap",
-                    "flexShrink": 0,
                     "borderRadius": "6px",
                 },
                 children=[
-                    # Frequency slider
-                    html.Div(style={"display": "flex", "alignItems": "center", "gap": "10px"},
-                             children=[
-                                 html.Label("Min Frequency",
-                                            className="label is-small",
-                                            style={"marginBottom": 0, "whiteSpace": "nowrap"}),
-                                 html.Div(
-                                     dcc.Slider(
-                                         id="freq-slider",
-                                         min=0, max=1000, step=100, value=0,
-                                         marks={0: "0", 500: "500", 1000: "1k"},
-                                         tooltip={"placement": "bottom",
-                                                  "always_visible": False},
-                                         updatemode="mouseup",
-                                     ),
-                                     style={"width": "220px"},
-                                 ),
-                             ]),
-
-                    # Layout picker
-                    html.Div(style={"display": "flex", "alignItems": "center", "gap": "8px"},
-                             children=[
-                                 html.Label("Layout",
-                                            className="label is-small",
-                                            style={"marginBottom": 0}),
-                                 dcc.Dropdown(
-                                     id="layout-dropdown",
-                                     options=[
-                                         {"label": "Dagre LR", "value": "dagre"},
-                                         {"label": "Breadthfirst", "value": "breadthfirst"},
-                                         {"label": "Circle", "value": "circle"},
-                                         {"label": "Cose", "value": "cose"},
-                                     ],
-                                     value="dagre",
-                                     clearable=False,
-                                     style={"width": "150px", "fontSize": "13px"},
-                                 ),
-                             ]),
-
-                    # Legend (Bulma tags)
+                    html.Div(
+                        style={"display": "flex", "alignItems": "center", "gap": "10px"},
+                        children=[
+                            html.Label("Min Frequency", className="label is-small",
+                                       style={"marginBottom": 0, "whiteSpace": "nowrap"}),
+                            html.Div(
+                                dcc.Slider(
+                                    id="freq-slider",
+                                    # Slider uses indices 0–19 that map to FREQ_STEPS.
+                                    # Equal visual spacing between geometric steps.
+                                    min=0, max=19, step=1, value=0,
+                                    marks=_INIT_MARKS,
+                                    tooltip={"placement": "bottom", "always_visible": False},
+                                    updatemode="mouseup",
+                                ),
+                                style={"width": "300px"},
+                            ),
+                        ],
+                    ),
+                    html.Div(
+                        style={"display": "flex", "alignItems": "center", "gap": "8px"},
+                        children=[
+                            html.Label("Layout", className="label is-small",
+                                       style={"marginBottom": 0}),
+                            dcc.Dropdown(
+                                id="layout-dropdown",
+                                options=[
+                                    {"label": "Dagre LR",     "value": "dagre"},
+                                    {"label": "Breadthfirst", "value": "breadthfirst"},
+                                    {"label": "Circle",       "value": "circle"},
+                                    {"label": "Cose",         "value": "cose"},
+                                ],
+                                value="dagre",
+                                clearable=False,
+                                style={"width": "150px", "fontSize": "13px"},
+                            ),
+                        ],
+                    ),
                     html.Div(
                         style={"display": "flex", "alignItems": "center",
                                "flexWrap": "wrap", "gap": "4px"},
@@ -447,8 +550,7 @@ app.layout = html.Div(
                                     cat.replace("_", " ").title(),
                                     className="tag",
                                     style={"backgroundColor": color,
-                                           "color": "#FFF",
-                                           "fontSize": "10px"},
+                                           "color": "#FFF", "fontSize": "10px"},
                                 )
                                 for cat, color in CATEGORY_COLORS.items()
                             ],
@@ -456,70 +558,70 @@ app.layout = html.Div(
                                       style={"fontSize": "10px"}),
                             html.Span("■ End", className="tag is-warning is-light",
                                       style={"fontSize": "10px"}),
+                            html.Span("↺ Loop", className="tag",
+                                      style={"backgroundColor": "#EF6C00",
+                                             "color": "#FFF", "fontSize": "10px"}),
                         ],
                     ),
                 ],
             ),
 
-            # ── Graph + sidebar row ────────────────────────────────────────
+            # ── Details card (above graph) ──────────────────────────────────
             html.Div(
-                style={"display": "flex", "flex": 1, "overflow": "hidden",
-                       "gap": "8px", "paddingBottom": "8px"},
+                className="box",
+                style={
+                    "margin": "0 0 8px 0",
+                    "padding": "0.65rem 1rem",
+                    "minHeight": "52px",
+                    "display": "flex",
+                    "alignItems": "center",
+                    "borderRadius": "6px",
+                },
                 children=[
-
-                    # Graph area — concrete calc() height avoids the 0px
-                    # resolved-height problem that occurs when height:"100%"
-                    # is used inside dcc.Loading's anonymous wrapper divs.
-                    # Breakdown: 100vh - navbar(52) - controls(78) - gaps(30) = ~210px
-                    cyto.Cytoscape(
-                        id="dfg-graph",
-                        elements=[],
-                        style={
-                            "width": "100%",
-                            "height": "calc(100vh - 210px)",
-                            "minHeight": "400px",
-                            "flex": 1,
-                            "backgroundColor": "#FFFFFF",
-                            "borderRadius": "6px",
-                            "border": "1px solid #DEE2E6",
-                        },
-                        layout={"name": "dagre", "rankDir": "LR",
-                                "nodeSep": 50, "rankSep": 100,
-                                "edgeSep": 20},
-                        stylesheet=CYTOSCAPE_STYLE,
-                        responsive=True,
-                        minZoom=0.15,
-                        maxZoom=3.0,
-                    ),
-
-                    # Sidebar detail panel (Bulma card)
-                    html.Div(
-                        className="card",
-                        style={"width": "240px", "flexShrink": 0,
-                               "overflowY": "auto"},
-                        children=[
-                            html.Div(className="card-header", children=[
-                                html.P("Details", className="card-header-title",
-                                       style={"fontSize": "13px", "padding": "0.6rem 1rem"}),
-                            ]),
-                            html.Div(
-                                className="card-content",
-                                style={"padding": "0.75rem"},
-                                children=[
-                                    html.Div(id="detail-content", children=[
-                                        html.P("Click a node or edge.",
-                                               className="has-text-grey is-size-7"),
-                                    ]),
-                                ],
-                            ),
-                        ],
-                    ),
+                    html.Div(id="detail-content", style={"width": "100%"}, children=[
+                        html.P("Click a node or edge to see details.",
+                               className="has-text-grey is-size-7",
+                               style={"margin": 0}),
+                    ]),
                 ],
             ),
 
-            # ── Hidden stores + interval ───────────────────────────────────
+            # ── DFG Graph (full width) ──────────────────────────────────────
+            cyto.Cytoscape(
+                id="dfg-graph",
+                elements=[],
+                stylesheet=BASE_STYLESHEET,
+                style={
+                    "width": "100%",
+                    "height": "550px",
+                    "backgroundColor": "#FFFFFF",
+                    "borderRadius": "6px",
+                    "border": "1px solid #DEE2E6",
+                },
+                layout={"name": "dagre", "rankDir": "LR",
+                        "nodeSep": 50, "rankSep": 100, "edgeSep": 20},
+                responsive=True,
+                minZoom=0.15,
+                maxZoom=3.0,
+            ),
+
+            # ── Node connection stats panel (below graph) ───────────────────
+            html.Div(
+                className="box",
+                id="node-stats-panel",
+                style={"marginTop": "8px", "padding": "0.75rem 1rem",
+                       "borderRadius": "6px"},
+                children=[
+                    html.P("Select a node to see connection statistics.",
+                           className="has-text-grey is-size-7",
+                           style={"margin": 0}),
+                ],
+            ),
+
+            # ── Hidden stores + interval ────────────────────────────────────
             dcc.Store(id="nodes-store"),
             dcc.Store(id="edges-store"),
+            dcc.Store(id="selected-node-store"),
             dcc.Interval(id="load-interval", interval=500, max_intervals=1),
         ],
     )],
@@ -530,32 +632,23 @@ app.layout = html.Div(
 
 def _slider_config(max_freq: int) -> tuple[int, int, dict]:
     """
-    Return (slider_max, step, marks) scaled to the actual data range.
+    Return (slider_max_index, step, marks) for the frequency slider.
 
-    Targets ~8 usable positions. Step is rounded to a 'nice' number so the
-    slider doesn't land on awkward values.  Marks are placed at 0, 25%, 50%,
-    75%, and 100% of the range.
+    The slider uses *index* positions (0 to N-1) so that the geometric
+    FREQ_STEPS sequence gets even visual spacing. update_graph translates the
+    index back to the actual frequency value via FREQ_STEPS[index].
     """
-    if max_freq <= 0:
-        return 100, 10, {0: "0", 100: "100"}
-
-    # Round max up to next multiple of 10 for a clean endpoint
-    slider_max = math.ceil(max_freq / 10) * 10
-
-    # Step = ~1/8 of range, rounded to a nice number
-    raw_step = slider_max / 8
-    magnitude = 10 ** math.floor(math.log10(raw_step)) if raw_step >= 1 else 1
-    step = max(1, round(raw_step / magnitude) * magnitude)
-
-    pcts = [0, 0.25, 0.5, 0.75, 1.0]
-    marks = {
-        int(p * slider_max): (
-            f"{int(p * slider_max):,}" if p * slider_max >= 1000
-            else str(int(p * slider_max))
-        )
-        for p in pcts
-    }
-    return slider_max, step, marks
+    valid_steps = [s for s in FREQ_STEPS if s <= max_freq] or [0]
+    n = len(valid_steps)
+    show_all = n <= 8
+    marks = {}
+    for i, v in enumerate(valid_steps):
+        show_label = show_all or i % 2 == 0 or i == n - 1
+        marks[i] = {
+            "label": _fmt_step(v) if show_label else " ",
+            "style": {"fontSize": "10px"},
+        }
+    return n - 1, 1, marks  # max_index, step, marks
 
 
 @callback(
@@ -564,16 +657,14 @@ def _slider_config(max_freq: int) -> tuple[int, int, dict]:
     Output("freq-slider", "max"),
     Output("freq-slider", "step"),
     Output("freq-slider", "marks"),
+    Output("freq-slider", "value"),
     Output("status-banner", "children"),
     Output("status-banner", "style"),
-    # prevent_initial_call=True: neither input fires during the initial HTTP GET,
-    # so the page HTML is returned immediately without waiting for SQL.
     Input("load-interval", "n_intervals"),
     Input("refresh-btn", "n_clicks"),
     prevent_initial_call=True,
 )
 def load_data(_n_intervals, _n_clicks):
-    """Load DFG data asynchronously after the page has already been served."""
     try:
         nodes_df, edges_df = load_dfg_data()
         max_freq = int(edges_df["edge_frequency"].max()) if not edges_df.empty else 0
@@ -586,15 +677,12 @@ def load_data(_n_intervals, _n_clicks):
         return (
             nodes_df.to_json(orient="records"),
             edges_df.to_json(orient="records"),
-            slider_max,
-            step,
-            marks,
-            banner_text,
-            BANNER_OK,
+            slider_max, step, marks, 0,
+            banner_text, BANNER_OK,
         )
     except Exception as exc:
         logger.error("Failed to load DFG data: %s", exc)
-        return "[]", "[]", 100, 10, {0: "0", 100: "100"}, f"Error: {exc}", BANNER_ERROR
+        return "[]", "[]", 19, 1, _INIT_MARKS, 0, f"Error: {exc}", BANNER_ERROR
 
 
 @callback(
@@ -605,15 +693,20 @@ def load_data(_n_intervals, _n_clicks):
     Input("freq-slider", "value"),
     Input("layout-dropdown", "value"),
 )
-def update_graph(nodes_json, edges_json, min_freq, layout_name):
-    """Re-render the Cytoscape graph when data or filters change."""
+def update_graph(nodes_json, edges_json, freq_idx, layout_name):
+    """Rebuild graph elements when data or filter changes. Does NOT touch the
+    stylesheet — selection highlighting is handled separately so the layout
+    does not re-run every time the user clicks a node."""
     if not nodes_json or nodes_json == "[]":
         return [], {"name": "dagre"}
 
+    # Translate slider index to actual frequency threshold
+    idx = int(freq_idx) if freq_idx is not None else 0
+    min_freq = FREQ_STEPS[idx] if 0 <= idx < len(FREQ_STEPS) else 0
+
     nodes_df = pd.read_json(nodes_json, orient="records")
     edges_df = pd.read_json(edges_json, orient="records")
-
-    elements = build_cytoscape_elements(nodes_df, edges_df, min_freq=min_freq or 0)
+    elements = build_cytoscape_elements(nodes_df, edges_df, min_freq=min_freq)
 
     layout_cfg = {"name": layout_name}
     if layout_name == "dagre":
@@ -625,83 +718,240 @@ def update_graph(nodes_json, edges_json, min_freq, layout_name):
 
 
 @callback(
+    Output("selected-node-store", "data"),
+    Input("dfg-graph", "selectedNodeData"),
+)
+def store_selected_node(selected_data):
+    """Track the currently selected node. Fires with [] when user clicks
+    the graph background, which clears the selection."""
+    if not selected_data:
+        return None
+    return selected_data[0].get("id")
+
+
+@callback(
+    Output("dfg-graph", "stylesheet"),
+    Input("selected-node-store", "data"),
+    Input("edges-store", "data"),
+)
+def update_stylesheet(selected_node_id, edges_json):
+    """Return a stylesheet that highlights the selected node, its outgoing
+    connections, and neighbor nodes. Only the stylesheet prop changes — the
+    elements prop is untouched, so the layout stays stable."""
+    return _compute_stylesheet(selected_node_id, edges_json)
+
+
+@callback(
     Output("detail-content", "children"),
     Input("dfg-graph", "tapNodeData"),
     Input("dfg-graph", "tapEdgeData"),
+    State("edges-store", "data"),
 )
-def show_detail(node_data, edge_data):
-    """Populate the sidebar with details for the clicked node or edge."""
+def show_detail(node_data, edge_data, edges_json):
+    """Populate the details bar (above the graph) for the clicked node/edge."""
     ctx = dash.callback_context
     if not ctx.triggered:
-        return html.P("Click a node or edge.",
-                      style={"color": "#90A4AE", "fontSize": "13px"})
+        return html.P("Click a node or edge to see details.",
+                      style={"color": "#90A4AE", "fontSize": "13px", "margin": 0})
 
     trigger_id = ctx.triggered[0]["prop_id"]
 
     if "tapNodeData" in trigger_id and node_data:
         cat = node_data.get("category", "")
         color = CATEGORY_COLORS.get(cat, DEFAULT_COLOR)
-        return [
-            html.Div(
+        is_start = node_data.get("is_start", False)
+        is_end = node_data.get("is_end", False)
+        has_loop = node_data.get("has_self_loop", False)
+
+        # Count outgoing edges for this node
+        n_connections = 0
+        if edges_json and edges_json != "[]":
+            try:
+                edf = pd.read_json(edges_json, orient="records")
+                n_connections = int(
+                    (edf["source_activity"] == node_data.get("activity_name", "")).sum()
+                )
+            except Exception:
+                pass
+
+        avg_ms = node_data.get("avg_duration_ms", 0) or 0
+        chips = [
+            html.Span(
                 node_data.get("activity_name", ""),
                 style={
-                    "backgroundColor": color,
-                    "color": "#FFF",
-                    "padding": "8px 12px",
-                    "borderRadius": "4px",
-                    "fontWeight": "bold",
-                    "fontSize": "13px",
-                    "marginBottom": "12px",
-                    "wordBreak": "break-word",
+                    "backgroundColor": color, "color": "#FFF",
+                    "padding": "4px 12px", "borderRadius": "4px",
+                    "fontWeight": "bold", "fontSize": "13px",
+                    "whiteSpace": "nowrap",
                 },
             ),
-            _detail_row("Category", cat.replace("_", " ").title()),
-            _detail_row("Occurrences", f"{node_data.get('occurrence_count', 0):,}"),
-            _detail_row("Cases", f"{node_data.get('case_count', 0):,}"),
-            _detail_row("Start of case", f"{node_data.get('start_count', 0):,}"),
-            _detail_row("End of case", f"{node_data.get('end_count', 0):,}"),
-            _detail_row(
-                "Avg self-duration",
-                _format_ms(node_data.get("avg_duration_ms", 0))
-                if node_data.get("avg_duration_ms", 0) > 0 else "—",
-            ),
+            _stat_chip("Category", cat.replace("_", " ").title()),
+            _stat_chip("Occurrences", f"{node_data.get('occurrence_count', 0):,}"),
+            _stat_chip("Cases", f"{node_data.get('case_count', 0):,}"),
+            _stat_chip("Outgoing Connections", str(n_connections)),
+            _stat_chip("Avg Self-Duration", _format_ms(avg_ms) if avg_ms > 0 else "—"),
         ]
+        if is_start:
+            chips.append(html.Span("START", className="tag is-success is-small",
+                                   style={"alignSelf": "center"}))
+        if is_end:
+            chips.append(html.Span("END", className="tag is-warning is-small",
+                                   style={"alignSelf": "center"}))
+        if has_loop:
+            chips.append(html.Span("↺ SELF-LOOP", className="tag is-small",
+                                   style={"alignSelf": "center",
+                                          "backgroundColor": "#EF6C00",
+                                          "color": "#FFF"}))
+        return html.Div(
+            style={"display": "flex", "alignItems": "center",
+                   "gap": "12px", "flexWrap": "wrap"},
+            children=chips,
+        )
 
     if "tapEdgeData" in trigger_id and edge_data:
-        return [
-            html.Div(
+        is_loop = edge_data.get("is_self_loop", False)
+        chips = [
+            html.Span(
                 f"{edge_data.get('source', '')} → {edge_data.get('target', '')}",
                 style={
-                    "backgroundColor": "#37474F",
+                    "backgroundColor": "#EF6C00" if is_loop else "#37474F",
                     "color": "#FFF",
-                    "padding": "8px 12px",
-                    "borderRadius": "4px",
-                    "fontWeight": "bold",
-                    "fontSize": "12px",
-                    "marginBottom": "12px",
-                    "wordBreak": "break-word",
+                    "padding": "4px 12px", "borderRadius": "4px",
+                    "fontWeight": "bold", "fontSize": "13px",
+                    "whiteSpace": "nowrap",
                 },
             ),
-            _detail_row("Frequency", f"{edge_data.get('edge_frequency', 0):,}"),
-            _detail_row("Cases", f"{edge_data.get('case_count', 0):,}"),
-            _detail_row("Avg transition", _format_ms(edge_data.get("avg_ms"))),
-            _detail_row("Median (p50)", _format_ms(edge_data.get("p50_ms"))),
-            _detail_row("p95 transition", _format_ms(edge_data.get("p95_ms"))),
+            _stat_chip("Frequency", f"{edge_data.get('edge_frequency', 0):,}"),
+            _stat_chip("Cases", f"{edge_data.get('case_count', 0):,}"),
+            _stat_chip("Avg Transition", _format_ms(edge_data.get("avg_ms"))),
+            _stat_chip("Median (p50)",   _format_ms(edge_data.get("p50_ms"))),
+            _stat_chip("p95 Transition", _format_ms(edge_data.get("p95_ms"))),
         ]
+        if is_loop:
+            chips.append(html.Span("↺ SELF-LOOP", className="tag is-small",
+                                   style={"alignSelf": "center",
+                                          "backgroundColor": "#EF6C00",
+                                          "color": "#FFF"}))
+        return html.Div(
+            style={"display": "flex", "alignItems": "center",
+                   "gap": "12px", "flexWrap": "wrap"},
+            children=chips,
+        )
 
-    return html.P("Click a node or edge.",
-                  style={"color": "#90A4AE", "fontSize": "13px"})
+    return html.P("Click a node or edge to see details.",
+                  style={"color": "#90A4AE", "fontSize": "13px", "margin": 0})
 
 
-def _detail_row(label: str, value: str):
-    return html.Div(
-        [
-            html.Span(label + ":", style={"color": "#607D8B", "fontSize": "12px",
-                                          "display": "inline-block", "width": "130px"}),
-            html.Span(value, style={"fontWeight": "bold", "fontSize": "13px"}),
-        ],
-        style={"marginBottom": "6px"},
+@callback(
+    Output("node-stats-panel", "children"),
+    Input("selected-node-store", "data"),
+    Input("edges-store", "data"),
+)
+def show_node_stats(selected_node_id, edges_json):
+    """
+    Show a connection breakdown table below the graph when a node is selected.
+
+    Columns: Target Node | Frequency | % of Outgoing | Cases |
+             Avg Time | Median (p50) | p95
+    """
+    if not selected_node_id:
+        return html.P("Select a node to see connection statistics.",
+                      className="has-text-grey is-size-7", style={"margin": 0})
+
+    if not edges_json or edges_json == "[]":
+        return html.P("No edge data available yet.",
+                      className="has-text-grey is-size-7", style={"margin": 0})
+
+    try:
+        edges_df = pd.read_json(edges_json, orient="records")
+    except Exception:
+        return html.P("Error reading edge data.",
+                      className="has-text-grey is-size-7", style={"margin": 0})
+
+    outgoing = (
+        edges_df[edges_df["source_activity"] == selected_node_id]
+        .sort_values("edge_frequency", ascending=False)
     )
+
+    node_label = selected_node_id.replace("_", " ").title()
+    header = html.P(
+        [html.Strong("Connections from: "), node_label],
+        style={"fontSize": "13px", "marginBottom": "10px"},
+    )
+
+    if outgoing.empty:
+        return html.Div([
+            header,
+            html.P("No outgoing connections (end node).",
+                   className="has-text-grey is-size-7"),
+        ])
+
+    total_freq = outgoing["edge_frequency"].sum()
+
+    rows = []
+    for _, row in outgoing.iterrows():
+        freq = int(row["edge_frequency"])
+        pct = freq / total_freq * 100 if total_freq > 0 else 0
+        target_label = str(row["target_activity"]).replace("_", " ").title()
+        is_self = row["source_activity"] == row["target_activity"]
+
+        # Inline mini progress bar
+        bar_width = max(4, int(pct))
+        pct_cell = html.Td(
+            style={"whiteSpace": "nowrap"},
+            children=[
+                html.Span(f"{pct:.1f}% ", style={"fontSize": "11px"}),
+                html.Span(
+                    style={
+                        "display": "inline-block",
+                        "width": f"{bar_width}px",
+                        "height": "6px",
+                        "backgroundColor": "#1565C0",
+                        "borderRadius": "3px",
+                        "verticalAlign": "middle",
+                        "maxWidth": "80px",
+                    },
+                ),
+            ],
+        )
+
+        target_cell = html.Td(
+            style={"fontWeight": "500"},
+            children=[
+                target_label,
+                html.Span(" ↺", style={"color": "#EF6C00", "fontWeight": "bold"})
+                if is_self else None,
+            ],
+        )
+
+        rows.append(html.Tr([
+            target_cell,
+            html.Td(f"{freq:,}"),
+            pct_cell,
+            html.Td(f"{int(row.get('case_count', 0)):,}"),
+            html.Td(_format_ms(row.get("avg_transition_duration_ms", 0))),
+            html.Td(_format_ms(row.get("p50_transition_duration_ms", 0))),
+            html.Td(_format_ms(row.get("p95_transition_duration_ms", 0))),
+        ]))
+
+    table = html.Table(
+        className="table is-narrow is-hoverable is-fullwidth",
+        style={"fontSize": "12px"},
+        children=[
+            html.Thead(html.Tr([
+                html.Th("Target Node"),
+                html.Th("Frequency"),
+                html.Th("% of Outgoing"),
+                html.Th("Cases"),
+                html.Th("Avg Time"),
+                html.Th("Median"),
+                html.Th("p95"),
+            ])),
+            html.Tbody(rows),
+        ],
+    )
+
+    return html.Div([header, table])
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
