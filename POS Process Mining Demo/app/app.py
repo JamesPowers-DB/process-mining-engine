@@ -150,14 +150,6 @@ def load_dfg_data():
 
 # ── Cytoscape element builder ─────────────────────────────────────────────────
 
-def _node_size(occurrence_count: int, max_count: int) -> int:
-    """Scale node diameter between 40px and 120px based on occurrence_count."""
-    if max_count == 0:
-        return 60
-    ratio = math.sqrt(occurrence_count / max_count)
-    return int(40 + ratio * 80)
-
-
 def _edge_width(frequency: int, max_freq: int) -> float:
     """Scale edge width between 1px and 12px based on frequency."""
     if max_freq == 0:
@@ -184,7 +176,6 @@ def build_cytoscape_elements(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
     if nodes_df.empty:
         return elements
 
-    max_count = int(nodes_df["occurrence_count"].max())
     max_freq = int(edges_df["edge_frequency"].max()) if not edges_df.empty else 1
 
     filtered_edges = edges_df[edges_df["edge_frequency"] >= min_freq]
@@ -204,7 +195,6 @@ def build_cytoscape_elements(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
 
         category = row.get("activity_category", "")
         color = CATEGORY_COLORS.get(category, DEFAULT_COLOR)
-        size = _node_size(int(row["occurrence_count"]), max_count)
 
         elements.append({
             "data": {
@@ -218,7 +208,6 @@ def build_cytoscape_elements(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
                 "avg_duration_ms": float(row.get("avg_activity_duration_ms", 0) or 0),
                 "category": category,
                 "color": color,
-                "size": size,
                 "is_start": row["start_count"] > 0,
                 "is_end": row["end_count"] > 0,
             }
@@ -246,64 +235,78 @@ def build_cytoscape_elements(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
 
 
 # ── Stylesheet ────────────────────────────────────────────────────────────────
+# Nodes: fixed-size round-rectangles, light-gray fill, category-colored border.
+# Edges: taxi (orthogonal elbow) routing.
+NODE_W = 160   # px — wide enough for longest wrapped activity label
+NODE_H = 60    # px — tall enough for 3 lines at 11px
+
 CYTOSCAPE_STYLE = [
     {
         "selector": "node",
         "style": {
             "label": "data(label)",
-            "width": "data(size)",
-            "height": "data(size)",
-            "background-color": "data(color)",
-            "color": "#FFFFFF",
-            "font-size": "10px",
+            "shape": "round-rectangle",
+            "width": NODE_W,
+            "height": NODE_H,
+            "background-color": "#F5F5F5",   # light gray fill
+            "border-color": "data(color)",    # category color on the outline
+            "border-width": 3,
+            "color": "#2D3748",               # dark text for contrast on gray
+            "font-size": "11px",
+            "font-family": "Segoe UI, system-ui, sans-serif",
             "text-wrap": "wrap",
-            "text-max-width": "80px",
+            "text-max-width": f"{NODE_W - 16}px",
             "text-valign": "center",
             "text-halign": "center",
-            "border-width": 2,
-            "border-color": "#FFFFFF",
-            "font-weight": "bold",
+            "font-weight": "600",
         },
     },
+    # Start nodes: thicker green border
     {
         "selector": "node[?is_start]",
         "style": {
             "border-width": 4,
-            "border-color": "#00E676",
+            "border-color": "#00897B",
         },
     },
+    # End nodes: thicker orange border
     {
         "selector": "node[?is_end]",
         "style": {
             "border-width": 4,
-            "border-style": "double",
-            "border-color": "#FF6D00",
+            "border-color": "#EF6C00",
         },
     },
+    # Selected: yellow highlight ring
     {
         "selector": "node:selected",
         "style": {
             "border-width": 5,
             "border-color": "#FFD600",
             "overlay-color": "#FFD600",
-            "overlay-padding": 4,
-            "overlay-opacity": 0.2,
+            "overlay-padding": 6,
+            "overlay-opacity": 0.15,
         },
     },
+    # Edges: orthogonal / elbow routing
     {
         "selector": "edge",
         "style": {
             "label": "data(label)",
             "width": "data(width)",
-            "line-color": "#90A4AE",
-            "target-arrow-color": "#90A4AE",
+            "line-color": "#B0BEC5",
+            "target-arrow-color": "#B0BEC5",
             "target-arrow-shape": "vee",
-            "curve-style": "bezier",
+            "curve-style": "taxi",
+            "taxi-direction": "horizontal",   # horizontal segment first (LR layout)
+            "taxi-turn": "50%",               # elbow at midpoint between nodes
+            "taxi-turn-min-distance": 20,
             "font-size": "9px",
-            "color": "#37474F",
+            "color": "#546E7A",
             "text-background-color": "#FFFFFF",
-            "text-background-opacity": 0.7,
+            "text-background-opacity": 0.85,
             "text-background-padding": "2px",
+            "text-rotation": "none",
         },
     },
     {
@@ -335,214 +338,236 @@ app = dash.Dash(
     __name__,
     title="POS Transaction Process Mining",
     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}],
+    external_stylesheets=["https://cdn.jsdelivr.net/npm/bulma@0.9.4/css/bulma.min.css"],
 )
 server = app.server  # expose WSGI server for gunicorn
 
+# ── App layout ────────────────────────────────────────────────────────────────
+# Outer div: full-viewport background.
+# Inner div: max 1000px, centered — all visible chrome lives here.
 app.layout = html.Div(
-    style={"fontFamily": "Segoe UI, sans-serif", "backgroundColor": "#ECEFF1",
-           "height": "100vh", "display": "flex", "flexDirection": "column"},
-    children=[
+    style={"backgroundColor": "#ECEFF1", "minHeight": "100vh",
+           "fontFamily": "Segoe UI, system-ui, sans-serif"},
+    children=[html.Div(
+        style={"maxWidth": "1000px", "margin": "0 auto",
+               "height": "100vh", "display": "flex", "flexDirection": "column"},
+        children=[
 
-        # ── Title bar ─────────────────────────────────────────────────────────
-        html.Div(
-            style={
-                "backgroundColor": "#1C2526",
-                "color": "#FFFFFF",
-                "padding": "10px 20px",
-                "display": "flex",
-                "alignItems": "center",
-                "justifyContent": "space-between",
-                "flexShrink": 0,
-            },
-            children=[
-                html.Div([
-                    html.H2("POS Transaction Process Mining",
-                            style={"margin": 0, "fontSize": "18px"}),
-                    html.Span(f"{CATALOG}.{SCHEMA}",
-                              style={"fontSize": "12px", "color": "#90A4AE"}),
-                ]),
-                html.Button("↻ Refresh Data", id="refresh-btn",
-                            style={
-                                "backgroundColor": "#FF3621",
-                                "color": "#FFF",
-                                "border": "none",
-                                "borderRadius": "4px",
-                                "padding": "6px 16px",
-                                "cursor": "pointer",
-                                "fontSize": "13px",
-                            }),
-            ],
-        ),
+            # ── Navbar (Bulma) ─────────────────────────────────────────────
+            html.Nav(
+                className="navbar is-dark",
+                style={"flexShrink": 0, "paddingLeft": "1rem", "paddingRight": "1rem"},
+                children=[
+                    html.Div(className="navbar-brand", children=[
+                        html.Div(className="navbar-item", children=[
+                            html.Div([
+                                html.P("POS Transaction Process Mining",
+                                       className="title is-5 has-text-white",
+                                       style={"margin": 0}),
+                                html.P(f"{CATALOG}.{SCHEMA}",
+                                       className="subtitle is-7 has-text-grey-light",
+                                       style={"margin": 0}),
+                            ]),
+                        ]),
+                    ]),
+                    html.Div(className="navbar-end", children=[
+                        html.Div(className="navbar-item", children=[
+                            html.Button("↻ Refresh", id="refresh-btn",
+                                        className="button is-danger is-small"),
+                        ]),
+                    ]),
+                ],
+            ),
 
-        # ── Status banner (hidden when idle) ──────────────────────────────────
-        html.Div(id="status-banner", style=BANNER_HIDDEN),
+            # ── Status notification (Bulma) ────────────────────────────────
+            html.Div(id="status-banner", style=BANNER_HIDDEN),
 
-        # ── Main content area ─────────────────────────────────────────────────
-        html.Div(
-            style={"display": "flex", "flex": 1, "overflow": "hidden"},
-            children=[
+            # ── Controls bar ───────────────────────────────────────────────
+            html.Div(
+                className="box",
+                style={
+                    "margin": "8px 0",
+                    "padding": "0.6rem 1rem",
+                    "display": "flex",
+                    "alignItems": "center",
+                    "gap": "24px",
+                    "flexWrap": "wrap",
+                    "flexShrink": 0,
+                    "borderRadius": "6px",
+                },
+                children=[
+                    # Frequency slider
+                    html.Div(style={"display": "flex", "alignItems": "center", "gap": "10px"},
+                             children=[
+                                 html.Label("Min Frequency",
+                                            className="label is-small",
+                                            style={"marginBottom": 0, "whiteSpace": "nowrap"}),
+                                 html.Div(
+                                     dcc.Slider(
+                                         id="freq-slider",
+                                         min=0, max=1000, step=100, value=0,
+                                         marks={0: "0", 500: "500", 1000: "1k"},
+                                         tooltip={"placement": "bottom",
+                                                  "always_visible": False},
+                                         updatemode="mouseup",
+                                     ),
+                                     style={"width": "220px"},
+                                 ),
+                             ]),
 
-                # ── Graph panel ───────────────────────────────────────────────
-                html.Div(
-                    style={"flex": 1, "position": "relative", "padding": "8px",
-                           "display": "flex", "flexDirection": "column"},
-                    children=[
+                    # Layout picker
+                    html.Div(style={"display": "flex", "alignItems": "center", "gap": "8px"},
+                             children=[
+                                 html.Label("Layout",
+                                            className="label is-small",
+                                            style={"marginBottom": 0}),
+                                 dcc.Dropdown(
+                                     id="layout-dropdown",
+                                     options=[
+                                         {"label": "Dagre LR", "value": "dagre"},
+                                         {"label": "Breadthfirst", "value": "breadthfirst"},
+                                         {"label": "Circle", "value": "circle"},
+                                         {"label": "Cose", "value": "cose"},
+                                     ],
+                                     value="dagre",
+                                     clearable=False,
+                                     style={"width": "150px", "fontSize": "13px"},
+                                 ),
+                             ]),
 
-                        # Controls bar
-                        html.Div(
-                            style={
-                                "backgroundColor": "#FFFFFF",
-                                "borderRadius": "6px",
-                                "padding": "8px 16px",
-                                "marginBottom": "8px",
-                                "display": "flex",
-                                "alignItems": "center",
-                                "gap": "20px",
-                                "flexWrap": "wrap",
-                                "boxShadow": "0 1px 3px rgba(0,0,0,0.15)",
-                                "flexShrink": 0,
-                            },
-                            children=[
-                                html.Div([
-                                    html.Label("Min Edge Frequency",
-                                               style={"fontSize": "12px", "marginRight": "8px"}),
-                                    html.Div(
-                                        dcc.Slider(
-                                            id="freq-slider",
-                                            min=0, max=100, step=5, value=0,
-                                            marks={0: "0", 25: "25", 50: "50",
-                                                   75: "75", 100: "100"},
-                                            tooltip={"placement": "bottom"},
-                                        ),
-                                        style={"width": "200px"},
-                                    ),
-                                ], style={"display": "flex", "alignItems": "center"}),
-
-                                html.Div([
-                                    html.Label("Layout",
-                                               style={"fontSize": "12px", "marginRight": "8px"}),
-                                    dcc.Dropdown(
-                                        id="layout-dropdown",
-                                        options=[
-                                            {"label": "Dagre (left→right)", "value": "dagre"},
-                                            {"label": "Breadthfirst", "value": "breadthfirst"},
-                                            {"label": "Circle", "value": "circle"},
-                                            {"label": "Cose", "value": "cose"},
-                                        ],
-                                        value="dagre",
-                                        clearable=False,
-                                        style={"width": "180px", "fontSize": "12px"},
-                                    ),
-                                ], style={"display": "flex", "alignItems": "center"}),
-
-                                # Legend
-                                html.Div(
-                                    [
-                                        html.Span("Legend: ",
-                                                  style={"fontSize": "12px",
-                                                         "fontWeight": "bold"}),
-                                        *[
-                                            html.Span(
-                                                cat.replace("_", " ").title(),
-                                                style={
-                                                    "backgroundColor": color,
-                                                    "color": "#FFF",
-                                                    "padding": "2px 8px",
-                                                    "borderRadius": "3px",
-                                                    "fontSize": "11px",
-                                                    "marginLeft": "4px",
-                                                },
-                                            )
-                                            for cat, color in CATEGORY_COLORS.items()
-                                        ],
-                                        html.Span(" ● Start",
-                                                  style={"fontSize": "11px",
-                                                         "color": "#00C853",
-                                                         "marginLeft": "8px"}),
-                                        html.Span(" ● End",
-                                                  style={"fontSize": "11px",
-                                                         "color": "#FF6D00",
-                                                         "marginLeft": "4px"}),
-                                    ],
-                                    style={"display": "flex", "alignItems": "center",
-                                           "flexWrap": "wrap"},
-                                ),
+                    # Legend (Bulma tags)
+                    html.Div(
+                        style={"display": "flex", "alignItems": "center",
+                               "flexWrap": "wrap", "gap": "4px"},
+                        children=[
+                            html.Span("Legend:", className="label is-small",
+                                      style={"marginBottom": 0, "marginRight": "4px"}),
+                            *[
+                                html.Span(
+                                    cat.replace("_", " ").title(),
+                                    className="tag",
+                                    style={"backgroundColor": color,
+                                           "color": "#FFF",
+                                           "fontSize": "10px"},
+                                )
+                                for cat, color in CATEGORY_COLORS.items()
                             ],
-                        ),
+                            html.Span("▶ Start", className="tag is-success is-light",
+                                      style={"fontSize": "10px"}),
+                            html.Span("■ End", className="tag is-warning is-light",
+                                      style={"fontSize": "10px"}),
+                        ],
+                    ),
+                ],
+            ),
 
-                        # Cytoscape graph — fills remaining height
-                        dcc.Loading(
-                            id="graph-loading",
-                            type="circle",
-                            color="#FF3621",
-                            children=cyto.Cytoscape(
-                                id="dfg-graph",
-                                elements=[],
-                                style={
-                                    "width": "100%",
-                                    "flex": 1,
-                                    "minHeight": "400px",
-                                    "backgroundColor": "#FAFAFA",
-                                    "borderRadius": "6px",
-                                    "boxShadow": "0 1px 3px rgba(0,0,0,0.15)",
-                                },
-                                layout={"name": "dagre", "rankDir": "LR",
-                                        "nodeSep": 60, "rankSep": 120},
-                                stylesheet=CYTOSCAPE_STYLE,
-                                responsive=True,
-                                minZoom=0.2,
-                                maxZoom=3.0,
+            # ── Graph + sidebar row ────────────────────────────────────────
+            html.Div(
+                style={"display": "flex", "flex": 1, "overflow": "hidden",
+                       "gap": "8px", "paddingBottom": "8px"},
+                children=[
+
+                    # Graph area — concrete calc() height avoids the 0px
+                    # resolved-height problem that occurs when height:"100%"
+                    # is used inside dcc.Loading's anonymous wrapper divs.
+                    # Breakdown: 100vh - navbar(52) - controls(78) - gaps(30) = ~210px
+                    cyto.Cytoscape(
+                        id="dfg-graph",
+                        elements=[],
+                        style={
+                            "width": "100%",
+                            "height": "calc(100vh - 210px)",
+                            "minHeight": "400px",
+                            "flex": 1,
+                            "backgroundColor": "#FFFFFF",
+                            "borderRadius": "6px",
+                            "border": "1px solid #DEE2E6",
+                        },
+                        layout={"name": "dagre", "rankDir": "LR",
+                                "nodeSep": 50, "rankSep": 100,
+                                "edgeSep": 20},
+                        stylesheet=CYTOSCAPE_STYLE,
+                        responsive=True,
+                        minZoom=0.15,
+                        maxZoom=3.0,
+                    ),
+
+                    # Sidebar detail panel (Bulma card)
+                    html.Div(
+                        className="card",
+                        style={"width": "240px", "flexShrink": 0,
+                               "overflowY": "auto"},
+                        children=[
+                            html.Div(className="card-header", children=[
+                                html.P("Details", className="card-header-title",
+                                       style={"fontSize": "13px", "padding": "0.6rem 1rem"}),
+                            ]),
+                            html.Div(
+                                className="card-content",
+                                style={"padding": "0.75rem"},
+                                children=[
+                                    html.Div(id="detail-content", children=[
+                                        html.P("Click a node or edge.",
+                                               className="has-text-grey is-size-7"),
+                                    ]),
+                                ],
                             ),
-                        ),
-                    ],
-                ),
+                        ],
+                    ),
+                ],
+            ),
 
-                # ── Sidebar: detail panel ─────────────────────────────────────
-                html.Div(
-                    id="detail-panel",
-                    style={
-                        "width": "300px",
-                        "backgroundColor": "#FFFFFF",
-                        "padding": "16px",
-                        "overflowY": "auto",
-                        "boxShadow": "-2px 0 6px rgba(0,0,0,0.1)",
-                        "flexShrink": 0,
-                    },
-                    children=[
-                        html.H3("Details", style={"marginTop": 0, "fontSize": "15px",
-                                                  "color": "#37474F"}),
-                        html.Div(id="detail-content",
-                                 children=[
-                                     html.P("Click a node or edge to inspect details.",
-                                            style={"fontSize": "13px", "color": "#90A4AE"}),
-                                 ]),
-                    ],
-                ),
-            ],
-        ),
-
-        # ── Hidden stores ─────────────────────────────────────────────────────
-        dcc.Store(id="nodes-store"),
-        dcc.Store(id="edges-store"),
-
-        # Fires once, 500 ms after page render — triggers the initial data load
-        # without blocking the HTTP response that delivers the page HTML.
-        dcc.Interval(id="load-interval", interval=500, max_intervals=1),
-    ],
+            # ── Hidden stores + interval ───────────────────────────────────
+            dcc.Store(id="nodes-store"),
+            dcc.Store(id="edges-store"),
+            dcc.Interval(id="load-interval", interval=500, max_intervals=1),
+        ],
+    )],
 )
 
 
 # ── Callbacks ─────────────────────────────────────────────────────────────────
 
+def _slider_config(max_freq: int) -> tuple[int, int, dict]:
+    """
+    Return (slider_max, step, marks) scaled to the actual data range.
+
+    Targets ~8 usable positions. Step is rounded to a 'nice' number so the
+    slider doesn't land on awkward values.  Marks are placed at 0, 25%, 50%,
+    75%, and 100% of the range.
+    """
+    if max_freq <= 0:
+        return 100, 10, {0: "0", 100: "100"}
+
+    # Round max up to next multiple of 10 for a clean endpoint
+    slider_max = math.ceil(max_freq / 10) * 10
+
+    # Step = ~1/8 of range, rounded to a nice number
+    raw_step = slider_max / 8
+    magnitude = 10 ** math.floor(math.log10(raw_step)) if raw_step >= 1 else 1
+    step = max(1, round(raw_step / magnitude) * magnitude)
+
+    pcts = [0, 0.25, 0.5, 0.75, 1.0]
+    marks = {
+        int(p * slider_max): (
+            f"{int(p * slider_max):,}" if p * slider_max >= 1000
+            else str(int(p * slider_max))
+        )
+        for p in pcts
+    }
+    return slider_max, step, marks
+
+
 @callback(
     Output("nodes-store", "data"),
     Output("edges-store", "data"),
     Output("freq-slider", "max"),
+    Output("freq-slider", "step"),
+    Output("freq-slider", "marks"),
     Output("status-banner", "children"),
     Output("status-banner", "style"),
-    # load-interval fires once at t+500ms; refresh-btn fires on click.
-    # prevent_initial_call=True ensures neither fires during the initial HTTP
-    # GET, so the page HTML is returned immediately.
+    # prevent_initial_call=True: neither input fires during the initial HTTP GET,
+    # so the page HTML is returned immediately without waiting for SQL.
     Input("load-interval", "n_intervals"),
     Input("refresh-btn", "n_clicks"),
     prevent_initial_call=True,
@@ -551,8 +576,8 @@ def load_data(_n_intervals, _n_clicks):
     """Load DFG data asynchronously after the page has already been served."""
     try:
         nodes_df, edges_df = load_dfg_data()
-        max_freq = int(edges_df["edge_frequency"].max()) if not edges_df.empty else 100
-        slider_max = max(100, (max_freq // 50 + 1) * 50)
+        max_freq = int(edges_df["edge_frequency"].max()) if not edges_df.empty else 0
+        slider_max, step, marks = _slider_config(max_freq)
         n_cases = int(nodes_df["case_count"].max()) if not nodes_df.empty else 0
         banner_text = (
             f"Loaded {len(nodes_df)} activities · {len(edges_df)} edges · "
@@ -562,12 +587,14 @@ def load_data(_n_intervals, _n_clicks):
             nodes_df.to_json(orient="records"),
             edges_df.to_json(orient="records"),
             slider_max,
+            step,
+            marks,
             banner_text,
             BANNER_OK,
         )
     except Exception as exc:
-        print(f"[ERROR] Failed to load DFG data: {exc}")
-        return "[]", "[]", 100, f"Error loading data: {exc}", BANNER_ERROR
+        logger.error("Failed to load DFG data: %s", exc)
+        return "[]", "[]", 100, 10, {0: "0", 100: "100"}, f"Error: {exc}", BANNER_ERROR
 
 
 @callback(
