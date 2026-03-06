@@ -18,6 +18,24 @@ time). A dcc.Interval fires 500 ms after the browser renders the page, which
 triggers the SQL load asynchronously. This prevents upstream proxy timeouts
 caused by slow SQL warehouse warm-up.
 
+Data flow
+---------
+1. load_raw_data  — SQL → raw-nodes-store / raw-edges-store (includes store_id, channel)
+                    Populates store-filter and channel-filter dropdown options.
+2. apply_filters  — Triggered by raw store changes OR filter dropdown changes.
+                    Pandas filter + aggregate → nodes-store / edges-store.
+                    Updates freq-slider range to match the filtered data.
+3. update_graph   — Reads nodes-store / edges-store, builds Cytoscape elements.
+4. *              — All other callbacks continue to consume nodes-store / edges-store
+                    unchanged (they always see aggregated, dimension-free data).
+
+Approximations when aggregating across dimensions
+-------------------------------------------------
+avg_transition_duration_ms, p50, p95: weighted mean-of-means — accurate when
+group sizes are similar; acceptable for process mining visualization.
+case_count: summed across groups — may overcount cases that span multiple
+store/channel values (rare in practice for POS transactions).
+
 Selection highlighting
 ----------------------
 Node selection is tracked via selectedNodeData (supports click-background-to-
@@ -111,12 +129,20 @@ def _query_df(sql: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=cols)
 
 
-def load_dfg_data():
-    logger.info("Loading DFG data from Unity Catalog...")
+def load_raw_dfg_data():
+    """
+    Load full DFG data including store_id and channel dimensions.
+    Returns raw (un-aggregated) DataFrames — one row per
+    (activity, store, channel) for nodes and (edge, store, channel) for edges.
+    The app aggregates across dimensions as needed based on active filters.
+    """
+    logger.info("Loading raw DFG data from Unity Catalog...")
 
     nodes_df = _query_df(f"""
         SELECT
             activity_name,
+            store_id,
+            channel,
             occurrence_count,
             case_count,
             start_count,
@@ -134,6 +160,8 @@ def load_dfg_data():
         SELECT
             source_activity,
             target_activity,
+            store_id,
+            channel,
             edge_frequency,
             case_count,
             avg_transition_duration_ms,
@@ -149,8 +177,71 @@ def load_dfg_data():
                 "p50_transition_duration_ms", "p95_transition_duration_ms"):
         edges_df[col] = pd.to_numeric(edges_df[col], errors="coerce").fillna(0)
 
-    logger.info("Loaded %d nodes, %d edges", len(nodes_df), len(edges_df))
+    logger.info(
+        "Loaded %d node rows, %d edge rows (across all stores/channels)",
+        len(nodes_df), len(edges_df),
+    )
     return nodes_df, edges_df
+
+
+# ── Pandas aggregation helpers ────────────────────────────────────────────────
+
+def _aggregate_edges(edges_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse a store/channel-dimensioned edges DataFrame to one row per
+    (source_activity, target_activity) by summing frequencies and averaging
+    duration stats. Note: averaged percentiles (p50, p95) and case_count sums
+    are approximations when aggregating across multiple dimensions.
+    """
+    if edges_df.empty:
+        return pd.DataFrame(columns=[
+            "source_activity", "target_activity", "edge_frequency", "case_count",
+            "avg_transition_duration_ms", "min_transition_duration_ms",
+            "max_transition_duration_ms", "p50_transition_duration_ms",
+            "p95_transition_duration_ms",
+        ])
+    return (
+        edges_df
+        .groupby(["source_activity", "target_activity"], as_index=False)
+        .agg(
+            edge_frequency=("edge_frequency", "sum"),
+            case_count=("case_count", "sum"),
+            avg_transition_duration_ms=("avg_transition_duration_ms", "mean"),
+            min_transition_duration_ms=("min_transition_duration_ms", "min"),
+            max_transition_duration_ms=("max_transition_duration_ms", "max"),
+            p50_transition_duration_ms=("p50_transition_duration_ms", "mean"),
+            p95_transition_duration_ms=("p95_transition_duration_ms", "mean"),
+        )
+        .sort_values("edge_frequency", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+def _aggregate_nodes(nodes_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Collapse a store/channel-dimensioned nodes DataFrame to one row per
+    (activity_name, activity_category). Occurrence and case counts are summed;
+    avg_activity_duration_ms is mean-of-means (approximate for incident nodes).
+    """
+    if nodes_df.empty:
+        return pd.DataFrame(columns=[
+            "activity_name", "occurrence_count", "case_count",
+            "start_count", "end_count", "avg_activity_duration_ms",
+            "activity_category",
+        ])
+    return (
+        nodes_df
+        .groupby(["activity_name", "activity_category"], as_index=False)
+        .agg(
+            occurrence_count=("occurrence_count", "sum"),
+            case_count=("case_count", "sum"),
+            start_count=("start_count", "sum"),
+            end_count=("end_count", "sum"),
+            avg_activity_duration_ms=("avg_activity_duration_ms", "mean"),
+        )
+        .sort_values("occurrence_count", ascending=False)
+        .reset_index(drop=True)
+    )
 
 
 # ── Cytoscape element builder ─────────────────────────────────────────────────
@@ -175,6 +266,11 @@ def _format_ms(ms) -> str:
 
 def build_cytoscape_elements(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
                               min_freq: int = 0):
+    """
+    Build Cytoscape element dicts from aggregated (dimension-free) DataFrames.
+    nodes_df and edges_df must NOT contain store_id / channel columns here —
+    apply_filters already aggregated those away before writing to nodes-store.
+    """
     elements = []
     if nodes_df.empty:
         return elements
@@ -203,7 +299,6 @@ def build_cytoscape_elements(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
         category = row.get("activity_category", "")
         color = CATEGORY_COLORS.get(category, DEFAULT_COLOR)
         has_loop = name in self_loop_set
-        # Append a circular arrow indicator to the label for self-loop activities
         label = name.replace("_", " ").title()
         if has_loop:
             label += "\n↺"
@@ -282,13 +377,9 @@ BASE_STYLESHEET = [
         "style": {"border-width": 4, "border-color": "#EF6C00"},
     },
     {
-        # Self-loop nodes: double border to signal the circular connection.
-        # The ↺ character in the label provides a second indicator.
+        # Self-loop nodes: double border + ↺ in label
         "selector": "node[?has_self_loop]",
-        "style": {
-            "border-style": "double",
-            "border-width": 7,
-        },
+        "style": {"border-style": "double", "border-width": 7},
     },
     {
         "selector": "edge",
@@ -298,10 +389,8 @@ BASE_STYLESHEET = [
             "line-color": "#B0BEC5",
             "target-arrow-color": "#B0BEC5",
             "target-arrow-shape": "vee",
-            # bezier auto-offsets parallel and bidirectional edge pairs so they
-            # don't overlap. control-point-step-size controls the spread.
-            # Note: Cytoscape.js canvas renderer does not support crossing
-            # bumps/bridges — bezier separation achieves the same visual clarity.
+            # bezier auto-offsets parallel and bidirectional edge pairs.
+            # control-point-step-size controls the spread between parallel edges.
             "curve-style": "bezier",
             "control-point-step-size": 40,
             "font-size": "9px",
@@ -313,8 +402,7 @@ BASE_STYLESHEET = [
         },
     },
     {
-        # Self-loop edges: orange dashed style for visual distinction.
-        # Cytoscape.js renders source==target edges as a loop automatically.
+        # Self-loop edges: orange dashed, Cytoscape auto-renders as loop
         "selector": "edge[?is_self_loop]",
         "style": {
             "line-color": "#EF6C00",
@@ -331,10 +419,8 @@ def _compute_stylesheet(selected_node_id: str | None,
                         edges_json: str | None) -> list:
     """
     Extend BASE_STYLESHEET with highlight rules for the selected node.
-
-    Uses Cytoscape data attribute selectors ([source = '...']) and #id selectors
-    rather than element classes — this lets us update only the stylesheet prop
-    (no element rebuild) so the layout stays stable while the user clicks around.
+    Uses stylesheet updates (not element class mutations) so the layout
+    stays stable while the user clicks around.
     """
     stylesheet = list(BASE_STYLESHEET)
     if not selected_node_id or not edges_json or edges_json == "[]":
@@ -349,20 +435,12 @@ def _compute_stylesheet(selected_node_id: str | None,
     neighbor_ids = list(outgoing["target_activity"].unique())
     non_dimmed = list(dict.fromkeys([selected_node_id] + neighbor_ids))
 
-    # Dim all nodes that are neither the selected node nor a neighbor.
     not_chain = "".join(f":not(#{nid})" for nid in non_dimmed)
-    stylesheet.append({
-        "selector": f"node{not_chain}",
-        "style": {"opacity": 0.18},
-    })
-
-    # Dim all edges except outgoing ones from the selected node
+    stylesheet.append({"selector": f"node{not_chain}", "style": {"opacity": 0.18}})
     stylesheet.append({
         "selector": f"edge[source != '{selected_node_id}']",
         "style": {"opacity": 0.07},
     })
-
-    # Highlight outgoing edges (including self-loop if present)
     stylesheet.append({
         "selector": f"edge[source = '{selected_node_id}']",
         "style": {
@@ -372,32 +450,23 @@ def _compute_stylesheet(selected_node_id: str | None,
             "opacity": 1.0,
         },
     })
-
-    # Highlight neighbor nodes (targets of outgoing edges)
     for nid in neighbor_ids:
         if nid == selected_node_id:
-            continue  # skip self-loop — selected node style wins below
+            continue
         stylesheet.append({
             "selector": f"#{nid}",
             "style": {
-                "border-color": "#FF6F00",
-                "border-width": 5,
-                "background-color": "#FFF3E0",
-                "opacity": 1.0,
+                "border-color": "#FF6F00", "border-width": 5,
+                "background-color": "#FFF3E0", "opacity": 1.0,
             },
         })
-
-    # Highlight selected node last so it wins over neighbor styles
     stylesheet.append({
         "selector": f"#{selected_node_id}",
         "style": {
-            "border-color": "#FFD600",
-            "border-width": 6,
-            "background-color": "#FFFDE7",
-            "opacity": 1.0,
+            "border-color": "#FFD600", "border-width": 6,
+            "background-color": "#FFFDE7", "opacity": 1.0,
         },
     })
-
     return stylesheet
 
 
@@ -496,30 +565,65 @@ app.layout = html.Div(
                     "padding": "0.6rem 1rem",
                     "display": "flex",
                     "alignItems": "center",
-                    "gap": "24px",
+                    "gap": "20px",
                     "flexWrap": "wrap",
                     "borderRadius": "6px",
                 },
                 children=[
+                    # Store filter
+                    html.Div(
+                        style={"display": "flex", "alignItems": "center", "gap": "8px"},
+                        children=[
+                            html.Label("Store", className="label is-small",
+                                       style={"marginBottom": 0, "whiteSpace": "nowrap"}),
+                            dcc.Dropdown(
+                                id="store-filter",
+                                options=[],
+                                value=None,
+                                multi=True,
+                                placeholder="All Stores",
+                                clearable=True,
+                                style={"width": "200px", "fontSize": "12px"},
+                            ),
+                        ],
+                    ),
+                    # Channel filter
+                    html.Div(
+                        style={"display": "flex", "alignItems": "center", "gap": "8px"},
+                        children=[
+                            html.Label("Channel", className="label is-small",
+                                       style={"marginBottom": 0, "whiteSpace": "nowrap"}),
+                            dcc.Dropdown(
+                                id="channel-filter",
+                                options=[],
+                                value=None,
+                                multi=True,
+                                placeholder="All Channels",
+                                clearable=True,
+                                style={"width": "200px", "fontSize": "12px"},
+                            ),
+                        ],
+                    ),
+                    # Min Frequency slider
                     html.Div(
                         style={"display": "flex", "alignItems": "center", "gap": "10px"},
                         children=[
-                            html.Label("Min Frequency", className="label is-small",
+                            html.Label("Min Freq", className="label is-small",
                                        style={"marginBottom": 0, "whiteSpace": "nowrap"}),
                             html.Div(
                                 dcc.Slider(
                                     id="freq-slider",
-                                    # Slider uses indices 0–19 that map to FREQ_STEPS.
-                                    # Equal visual spacing between geometric steps.
                                     min=0, max=19, step=1, value=0,
                                     marks=_INIT_MARKS,
-                                    tooltip={"placement": "bottom", "always_visible": False},
+                                    tooltip={"placement": "bottom",
+                                             "always_visible": False},
                                     updatemode="mouseup",
                                 ),
-                                style={"width": "300px"},
+                                style={"width": "260px"},
                             ),
                         ],
                     ),
+                    # Layout dropdown
                     html.Div(
                         style={"display": "flex", "alignItems": "center", "gap": "8px"},
                         children=[
@@ -535,10 +639,11 @@ app.layout = html.Div(
                                 ],
                                 value="dagre",
                                 clearable=False,
-                                style={"width": "150px", "fontSize": "13px"},
+                                style={"width": "140px", "fontSize": "13px"},
                             ),
                         ],
                     ),
+                    # Legend
                     html.Div(
                         style={"display": "flex", "alignItems": "center",
                                "flexWrap": "wrap", "gap": "4px"},
@@ -619,6 +724,10 @@ app.layout = html.Div(
             ),
 
             # ── Hidden stores + interval ────────────────────────────────────
+            # raw-*-store: full data with store_id / channel columns
+            # nodes-store / edges-store: aggregated (dimension-free) data for the graph
+            dcc.Store(id="raw-nodes-store"),
+            dcc.Store(id="raw-edges-store"),
             dcc.Store(id="nodes-store"),
             dcc.Store(id="edges-store"),
             dcc.Store(id="selected-node-store"),
@@ -633,10 +742,8 @@ app.layout = html.Div(
 def _slider_config(max_freq: int) -> tuple[int, int, dict]:
     """
     Return (slider_max_index, step, marks) for the frequency slider.
-
-    The slider uses *index* positions (0 to N-1) so that the geometric
-    FREQ_STEPS sequence gets even visual spacing. update_graph translates the
-    index back to the actual frequency value via FREQ_STEPS[index].
+    Uses index positions so geometric steps are evenly spaced visually.
+    update_graph translates the index back via FREQ_STEPS[index].
     """
     valid_steps = [s for s in FREQ_STEPS if s <= max_freq] or [0]
     n = len(valid_steps)
@@ -648,7 +755,64 @@ def _slider_config(max_freq: int) -> tuple[int, int, dict]:
             "label": _fmt_step(v) if show_label else " ",
             "style": {"fontSize": "10px"},
         }
-    return n - 1, 1, marks  # max_index, step, marks
+    return n - 1, 1, marks
+
+
+@callback(
+    Output("raw-nodes-store", "data"),
+    Output("raw-edges-store", "data"),
+    Output("store-filter", "options"),
+    Output("channel-filter", "options"),
+    Output("status-banner", "children"),
+    Output("status-banner", "style"),
+    Input("load-interval", "n_intervals"),
+    Input("refresh-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def load_raw_data(_n_intervals, _n_clicks):
+    """
+    Load the full DFG dataset (all stores, all channels) from Unity Catalog
+    and populate the filter dropdown options.
+    Does NOT aggregate — apply_filters handles that.
+    """
+    try:
+        nodes_df, edges_df = load_raw_dfg_data()
+
+        # Extract unique values for filter dropdowns
+        stores = sorted(
+            s for s in nodes_df["store_id"].dropna().unique().tolist()
+        ) if "store_id" in nodes_df.columns else []
+        channels = sorted(
+            c for c in nodes_df["channel"].dropna().unique().tolist()
+        ) if "channel" in nodes_df.columns else []
+
+        store_opts = [{"label": s, "value": s} for s in stores]
+        channel_opts = [
+            {"label": c.replace("_", " ").title(), "value": c}
+            for c in channels
+        ]
+
+        distinct_activities = nodes_df["activity_name"].nunique()
+        distinct_edge_types = (
+            edges_df[["source_activity", "target_activity"]]
+            .drop_duplicates().shape[0]
+        )
+        banner_text = (
+            f"Loaded {distinct_activities} activities · "
+            f"{distinct_edge_types} edge types · "
+            f"{len(stores)} stores · {len(channels)} channels"
+        )
+        return (
+            nodes_df.to_json(orient="records"),
+            edges_df.to_json(orient="records"),
+            store_opts,
+            channel_opts,
+            banner_text,
+            BANNER_OK,
+        )
+    except Exception as exc:
+        logger.error("Failed to load DFG data: %s", exc)
+        return "[]", "[]", [], [], f"Error: {exc}", BANNER_ERROR
 
 
 @callback(
@@ -658,31 +822,56 @@ def _slider_config(max_freq: int) -> tuple[int, int, dict]:
     Output("freq-slider", "step"),
     Output("freq-slider", "marks"),
     Output("freq-slider", "value"),
-    Output("status-banner", "children"),
-    Output("status-banner", "style"),
-    Input("load-interval", "n_intervals"),
-    Input("refresh-btn", "n_clicks"),
+    Input("raw-nodes-store", "data"),
+    Input("raw-edges-store", "data"),
+    Input("store-filter", "value"),
+    Input("channel-filter", "value"),
     prevent_initial_call=True,
 )
-def load_data(_n_intervals, _n_clicks):
+def apply_filters(raw_nodes_json, raw_edges_json, selected_stores, selected_channels):
+    """
+    Apply active store/channel filters to the raw data and aggregate across
+    the remaining dimensions. Writes the aggregated result to nodes-store and
+    edges-store so all downstream callbacks see dimension-free DataFrames.
+    Also recomputes the freq-slider range based on the filtered dataset.
+    """
+    if not raw_nodes_json or raw_nodes_json == "[]":
+        return "[]", "[]", 19, 1, _INIT_MARKS, 0
+
     try:
-        nodes_df, edges_df = load_dfg_data()
-        max_freq = int(edges_df["edge_frequency"].max()) if not edges_df.empty else 0
-        slider_max, step, marks = _slider_config(max_freq)
-        n_cases = int(nodes_df["case_count"].max()) if not nodes_df.empty else 0
-        banner_text = (
-            f"Loaded {len(nodes_df)} activities · {len(edges_df)} edges · "
-            f"{n_cases:,} cases"
+        nodes_df = pd.read_json(raw_nodes_json, orient="records")
+        edges_df = (
+            pd.read_json(raw_edges_json, orient="records")
+            if raw_edges_json and raw_edges_json != "[]"
+            else pd.DataFrame()
         )
-        return (
-            nodes_df.to_json(orient="records"),
-            edges_df.to_json(orient="records"),
-            slider_max, step, marks, 0,
-            banner_text, BANNER_OK,
-        )
-    except Exception as exc:
-        logger.error("Failed to load DFG data: %s", exc)
-        return "[]", "[]", 19, 1, _INIT_MARKS, 0, f"Error: {exc}", BANNER_ERROR
+    except Exception:
+        return "[]", "[]", 19, 1, _INIT_MARKS, 0
+
+    # Apply store filter (empty / None = all stores)
+    if selected_stores:
+        nodes_df = nodes_df[nodes_df["store_id"].isin(selected_stores)]
+        if not edges_df.empty:
+            edges_df = edges_df[edges_df["store_id"].isin(selected_stores)]
+
+    # Apply channel filter (empty / None = all channels)
+    if selected_channels:
+        nodes_df = nodes_df[nodes_df["channel"].isin(selected_channels)]
+        if not edges_df.empty:
+            edges_df = edges_df[edges_df["channel"].isin(selected_channels)]
+
+    # Aggregate across remaining store/channel combinations
+    nodes_agg = _aggregate_nodes(nodes_df)
+    edges_agg = _aggregate_edges(edges_df)
+
+    max_freq = int(edges_agg["edge_frequency"].max()) if not edges_agg.empty else 0
+    slider_max, step, marks = _slider_config(max_freq)
+
+    return (
+        nodes_agg.to_json(orient="records"),
+        edges_agg.to_json(orient="records"),
+        slider_max, step, marks, 0,
+    )
 
 
 @callback(
@@ -694,13 +883,10 @@ def load_data(_n_intervals, _n_clicks):
     Input("layout-dropdown", "value"),
 )
 def update_graph(nodes_json, edges_json, freq_idx, layout_name):
-    """Rebuild graph elements when data or filter changes. Does NOT touch the
-    stylesheet — selection highlighting is handled separately so the layout
-    does not re-run every time the user clicks a node."""
+    """Rebuild graph elements when data or filter changes."""
     if not nodes_json or nodes_json == "[]":
         return [], {"name": "dagre"}
 
-    # Translate slider index to actual frequency threshold
     idx = int(freq_idx) if freq_idx is not None else 0
     min_freq = FREQ_STEPS[idx] if 0 <= idx < len(FREQ_STEPS) else 0
 
@@ -722,8 +908,6 @@ def update_graph(nodes_json, edges_json, freq_idx, layout_name):
     Input("dfg-graph", "selectedNodeData"),
 )
 def store_selected_node(selected_data):
-    """Track the currently selected node. Fires with [] when user clicks
-    the graph background, which clears the selection."""
     if not selected_data:
         return None
     return selected_data[0].get("id")
@@ -735,9 +919,6 @@ def store_selected_node(selected_data):
     Input("edges-store", "data"),
 )
 def update_stylesheet(selected_node_id, edges_json):
-    """Return a stylesheet that highlights the selected node, its outgoing
-    connections, and neighbor nodes. Only the stylesheet prop changes — the
-    elements prop is untouched, so the layout stays stable."""
     return _compute_stylesheet(selected_node_id, edges_json)
 
 
@@ -748,7 +929,6 @@ def update_stylesheet(selected_node_id, edges_json):
     State("edges-store", "data"),
 )
 def show_detail(node_data, edge_data, edges_json):
-    """Populate the details bar (above the graph) for the clicked node/edge."""
     ctx = dash.callback_context
     if not ctx.triggered:
         return html.P("Click a node or edge to see details.",
@@ -763,7 +943,6 @@ def show_detail(node_data, edge_data, edges_json):
         is_end = node_data.get("is_end", False)
         has_loop = node_data.get("has_self_loop", False)
 
-        # Count outgoing edges for this node
         n_connections = 0
         if edges_json and edges_json != "[]":
             try:
@@ -850,9 +1029,8 @@ def show_detail(node_data, edge_data, edges_json):
 def show_node_stats(selected_node_id, edges_json):
     """
     Show a connection breakdown table below the graph when a node is selected.
-
-    Columns: Target Node | Frequency | % of Outgoing | Cases |
-             Avg Time | Median (p50) | p95
+    Reads from edges-store which is always the aggregated (dimension-free) view,
+    so stats already reflect the active store/channel filter.
     """
     if not selected_node_id:
         return html.P("Select a node to see connection statistics.",
@@ -887,7 +1065,6 @@ def show_node_stats(selected_node_id, edges_json):
         ])
 
     total_freq = outgoing["edge_frequency"].sum()
-
     rows = []
     for _, row in outgoing.iterrows():
         freq = int(row["edge_frequency"])
@@ -895,26 +1072,19 @@ def show_node_stats(selected_node_id, edges_json):
         target_label = str(row["target_activity"]).replace("_", " ").title()
         is_self = row["source_activity"] == row["target_activity"]
 
-        # Inline mini progress bar
         bar_width = max(4, int(pct))
         pct_cell = html.Td(
             style={"whiteSpace": "nowrap"},
             children=[
                 html.Span(f"{pct:.1f}% ", style={"fontSize": "11px"}),
-                html.Span(
-                    style={
-                        "display": "inline-block",
-                        "width": f"{bar_width}px",
-                        "height": "6px",
-                        "backgroundColor": "#1565C0",
-                        "borderRadius": "3px",
-                        "verticalAlign": "middle",
-                        "maxWidth": "80px",
-                    },
-                ),
+                html.Span(style={
+                    "display": "inline-block", "width": f"{bar_width}px",
+                    "height": "6px", "backgroundColor": "#1565C0",
+                    "borderRadius": "3px", "verticalAlign": "middle",
+                    "maxWidth": "80px",
+                }),
             ],
         )
-
         target_cell = html.Td(
             style={"fontWeight": "500"},
             children=[
@@ -923,7 +1093,6 @@ def show_node_stats(selected_node_id, edges_json):
                 if is_self else None,
             ],
         )
-
         rows.append(html.Tr([
             target_cell,
             html.Td(f"{freq:,}"),
@@ -939,13 +1108,9 @@ def show_node_stats(selected_node_id, edges_json):
         style={"fontSize": "12px"},
         children=[
             html.Thead(html.Tr([
-                html.Th("Target Node"),
-                html.Th("Frequency"),
-                html.Th("% of Outgoing"),
-                html.Th("Cases"),
-                html.Th("Avg Time"),
-                html.Th("Median"),
-                html.Th("p95"),
+                html.Th("Target Node"), html.Th("Frequency"),
+                html.Th("% of Outgoing"), html.Th("Cases"),
+                html.Th("Avg Time"), html.Th("Median"), html.Th("p95"),
             ])),
             html.Tbody(rows),
         ],
