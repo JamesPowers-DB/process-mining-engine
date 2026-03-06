@@ -344,8 +344,8 @@ def build_cytoscape_elements(nodes_df: pd.DataFrame, edges_df: pd.DataFrame,
 
 
 # ── Base stylesheet ───────────────────────────────────────────────────────────
-NODE_W = 180
-NODE_H = 60
+NODE_W = 140
+NODE_H = 50
 
 BASE_STYLESHEET = [
     {
@@ -355,10 +355,10 @@ BASE_STYLESHEET = [
             "shape": "round-rectangle",
             "width": NODE_W,
             "height": NODE_H,
-            "background-color": "#F5F5F5",
-            "border-color": "data(color)",
-            "border-width": 3,
-            "color": "#2D3748",
+            "background-color": "data(color)",
+            "border-color": "rgba(0,0,0,0.20)",
+            "border-width": 2,
+            "color": "#FFFFFF",
             "font-size": "11px",
             "font-family": "Segoe UI, system-ui, sans-serif",
             "text-wrap": "wrap",
@@ -370,11 +370,11 @@ BASE_STYLESHEET = [
     },
     {
         "selector": "node[?is_start]",
-        "style": {"border-width": 4, "border-color": "#00897B"},
+        "style": {"border-width": 4, "border-color": "#FFFFFF"},
     },
     {
         "selector": "node[?is_end]",
-        "style": {"border-width": 4, "border-color": "#EF6C00"},
+        "style": {"border-width": 4, "border-color": "#FFFFFF", "border-style": "dashed"},
     },
     {
         # Self-loop nodes: double border + ↺ in label
@@ -456,15 +456,13 @@ def _compute_stylesheet(selected_node_id: str | None,
         stylesheet.append({
             "selector": f"#{nid}",
             "style": {
-                "border-color": "#FF6F00", "border-width": 5,
-                "background-color": "#FFF3E0", "opacity": 1.0,
+                "border-color": "#FF6F00", "border-width": 5, "opacity": 1.0,
             },
         })
     stylesheet.append({
         "selector": f"#{selected_node_id}",
         "style": {
-            "border-color": "#FFD600", "border-width": 6,
-            "background-color": "#FFFDE7", "opacity": 1.0,
+            "border-color": "#FFD600", "border-width": 6, "opacity": 1.0,
         },
     })
     return stylesheet
@@ -623,26 +621,6 @@ app.layout = html.Div(
                             ),
                         ],
                     ),
-                    # Layout dropdown
-                    html.Div(
-                        style={"display": "flex", "alignItems": "center", "gap": "8px"},
-                        children=[
-                            html.Label("Layout", className="label is-small",
-                                       style={"marginBottom": 0}),
-                            dcc.Dropdown(
-                                id="layout-dropdown",
-                                options=[
-                                    {"label": "Dagre LR",     "value": "dagre"},
-                                    {"label": "Breadthfirst", "value": "breadthfirst"},
-                                    {"label": "Circle",       "value": "circle"},
-                                    {"label": "Cose",         "value": "cose"},
-                                ],
-                                value="dagre",
-                                clearable=False,
-                                style={"width": "140px", "fontSize": "13px"},
-                            ),
-                        ],
-                    ),
                     # Legend
                     html.Div(
                         style={"display": "flex", "alignItems": "center",
@@ -698,7 +676,7 @@ app.layout = html.Div(
                 stylesheet=BASE_STYLESHEET,
                 style={
                     "width": "100%",
-                    "height": "550px",
+                    "height": "1050px",
                     "backgroundColor": "#FFFFFF",
                     "borderRadius": "6px",
                     "border": "1px solid #DEE2E6",
@@ -880,12 +858,11 @@ def apply_filters(raw_nodes_json, raw_edges_json, selected_stores, selected_chan
     Input("nodes-store", "data"),
     Input("edges-store", "data"),
     Input("freq-slider", "value"),
-    Input("layout-dropdown", "value"),
 )
-def update_graph(nodes_json, edges_json, freq_idx, layout_name):
+def update_graph(nodes_json, edges_json, freq_idx):
     """Rebuild graph elements when data or filter changes."""
     if not nodes_json or nodes_json == "[]":
-        return [], {"name": "dagre"}
+        return [], {"name": "breadthfirst"}
 
     idx = int(freq_idx) if freq_idx is not None else 0
     min_freq = FREQ_STEPS[idx] if 0 <= idx < len(FREQ_STEPS) else 0
@@ -894,11 +871,7 @@ def update_graph(nodes_json, edges_json, freq_idx, layout_name):
     edges_df = pd.read_json(edges_json, orient="records")
     elements = build_cytoscape_elements(nodes_df, edges_df, min_freq=min_freq)
 
-    layout_cfg = {"name": layout_name}
-    if layout_name == "dagre":
-        layout_cfg.update({"rankDir": "LR", "nodeSep": 60, "rankSep": 120})
-    elif layout_name == "breadthfirst":
-        layout_cfg.update({"directed": True, "spacingFactor": 1.4})
+    layout_cfg = {"name": "breadthfirst", "directed": True, "spacingFactor": 1.2, "grid": True}
 
     return elements, layout_cfg
 
